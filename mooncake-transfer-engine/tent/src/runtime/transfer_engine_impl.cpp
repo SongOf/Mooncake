@@ -1241,6 +1241,28 @@ Status TransferEngineImpl::lazyFreeBatch() {
                 if (++batch->reclaim_failures >= kMaxReclaimAttempts) {
                     batch->reclaim_abandoned = true;
                     TENT_RECORD_BATCH_QUARANTINED();
+                    // The sweep stops touching this batch, so its queue
+                    // owners would keep their dispatch-window slots for
+                    // good. Give those back; the batch stays quarantined.
+                    if (runtime_queue_config_.enabled &&
+                        batch->queue_token != 0) {
+                        if (auto detach =
+                                detachQueuedOwnersOfBatch(batch, CANCELED);
+                            !detach.ok()) {
+                            LOG(WARNING)
+                                << "lazyFreeBatch: quarantined batch " << batch
+                                << ": could not release its queue "
+                                   "owners: "
+                                << detach.ToString();
+                        } else if (auto retire = retireQueueForBatch(batch);
+                                   !retire.ok()) {
+                            LOG(WARNING)
+                                << "lazyFreeBatch: quarantined batch " << batch
+                                << ": could not retire its queue "
+                                   "records: "
+                                << retire.ToString();
+                        }
+                    }
                     LOG(ERROR) << "lazyFreeBatch: batch " << batch << " failed "
                                << batch->reclaim_failures
                                << " consecutive reclaim attempts; giving up "
@@ -1316,6 +1338,24 @@ void TransferEngineImpl::adoptDeferredStageTeardown(
     std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
     for (auto batch_id : deferred.batches) {
         Batch* batch = (Batch*)batch_id;
+        // Nothing will poll this batch to a terminal state any more, so its
+        // queue owners would otherwise hold their dispatch-window slots and
+        // queue bytes until process exit -- enough of them and nothing is
+        // dispatched again. Settle them as CANCELED and retire the batch's
+        // queue records; the batch itself is still parked below.
+        if (runtime_queue_config_.enabled && batch->queue_token != 0) {
+            if (auto status = detachQueuedOwnersOfBatch(batch, CANCELED);
+                !status.ok()) {
+                LOG(WARNING) << "Deferred staging batch " << batch
+                             << ": could not release its queue owners: "
+                             << status.ToString();
+            }
+            if (auto status = retireQueueForBatch(batch); !status.ok()) {
+                LOG(WARNING) << "Deferred staging batch " << batch
+                             << ": could not retire its queue records: "
+                             << status.ToString();
+            }
+        }
         // Detach from the normal lifecycle: an undrained batch sits in its
         // shard's active_batches / alive_batches and possibly
         // batch_freelist_ (free_requested, still referenced), so the sweep
@@ -2435,6 +2475,45 @@ Status TransferEngineImpl::cancelQueuedOwner(QueueOwnerId owner_id) {
     return Status::OK();
 }
 
+Status TransferEngineImpl::finishDroppedOwner(QueueOwnerId owner_id) {
+    auto queued_it = queued_owners_.find(owner_id);
+    if (queued_it == queued_owners_.end()) {
+        return Status::InvalidEntry("queued owner not found" LOC_MARK);
+    }
+    auto& queued = queued_it->second;
+    if (queued.in_dispatch_window) {
+        return Status::InternalError(
+            "dropped queue owner was in the dispatch window" LOC_MARK);
+    }
+    // No complete(): the queue turned the owner terminal when it dropped it,
+    // and complete() only accepts a dispatching owner.
+    for (const auto task_id : queued.public_task_ids) {
+        queued.batch->task_list[task_id].status = CANCELED;
+    }
+    queued_owners_.erase(queued_it);
+    return Status::OK();
+}
+
+Status TransferEngineImpl::detachQueuedOwnersOfBatch(
+    Batch* batch, TransferStatusEnum terminal_status) {
+    std::vector<QueueOwnerId> owner_ids;
+    for (const auto& entry : queued_owners_) {
+        if (entry.second.batch == batch) owner_ids.push_back(entry.first);
+    }
+    for (const auto owner_id : owner_ids) {
+        auto queued_it = queued_owners_.find(owner_id);
+        if (queued_it == queued_owners_.end()) continue;
+        // A dispatched owner completes with the given status, which frees its
+        // dispatch-window slot; one still queued is cancelled where it stands.
+        if (queued_it->second.in_dispatch_window) {
+            CHECK_STATUS(finishQueuedOwner(owner_id, terminal_status));
+        } else {
+            CHECK_STATUS(cancelQueuedOwner(owner_id));
+        }
+    }
+    return Status::OK();
+}
+
 Status TransferEngineImpl::retireQueueForBatch(Batch* batch) {
     if (!batch || batch->queue_token == 0) return Status::OK();
     auto status = runtime_queue_->retireBatch(batch->queue_token);
@@ -2539,7 +2618,15 @@ Status TransferEngineImpl::refillDispatchWindow() {
         runtime_queue_config_.max_dispatch_owners - dispatch_inflight_owners_;
     const size_t byte_budget =
         runtime_queue_config_.max_dispatch_bytes - dispatch_inflight_bytes_;
-    auto picked = runtime_queue_->pickForDispatch(owner_budget, byte_budget);
+    std::vector<QueueOwnerId> dropped;
+    auto picked =
+        runtime_queue_->pickForDispatch(owner_budget, byte_budget, &dropped);
+    // The queue has already cancelled these; the impl still holds a record
+    // for each and the batch still reads them PENDING. Left alone they would
+    // keep the runtime queue "active" and grow the progress scan for good.
+    for (const auto owner_id : dropped) {
+        CHECK_STATUS(finishDroppedOwner(owner_id));
+    }
     for (const auto owner_id : picked) {
         CHECK_STATUS(dispatchQueuedOwner(owner_id));
     }
